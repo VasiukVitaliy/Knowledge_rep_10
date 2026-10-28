@@ -1,0 +1,10 @@
+requests
+beautifulsoup4
+trafilatura
+pymupdf
+numpy
+sentence-transformers
+faiss-cpu
+rank_bm25
+lxml
+lxml_html_clean

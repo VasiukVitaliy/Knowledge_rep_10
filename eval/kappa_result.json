@@ -1,0 +1,21 @@
+{
+  "kappa": 0.5416208287495415,
+  "po": 0.84,
+  "pe": 0.650944,
+  "matrix": [
+    [
+      88,
+      19
+    ],
+    [
+      1,
+      17
+    ]
+  ],
+  "n": 125,
+  "n_queries": 12,
+  "skipped_pairs": 0,
+  "interpretation": "суттєва",
+  "kappa_A_vs_evidence": 0.7739602169981915,
+  "kappa_B_vs_evidence": 0.36721183800623064
+}
