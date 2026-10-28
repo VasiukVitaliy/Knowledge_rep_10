@@ -1,433 +1,358 @@
-#!/usr/bin/env python3
-"""ЛР 10, Результат 4: гібридний пошук (BM25 + dense, RRF) і reranking.
-
-Що робить:
-  1. BM25 (rank_bm25) і dense-пошук (FAISS HNSW з index.py, косинус) над чанками;
-  2. злиття RRF (k = 60);
-  3. reranker (cross-encoder): топ-30 після RRF → топ-5;
-  4. pre-filter за метаданими (type, sensitivity, date) — кандидати відсікаються ДО ранжування;
-  5. оцінює 4 конфігурації (bm25, dense, hybrid, hybrid+rerank) на eval/index_queries.jsonl,
-     автоматично знаходить 3 запити, де гібрид виграє, і 1, де програє;
-  6. пише docs/hybrid_report.md.
-
-Залежності: pip install numpy sentence-transformers faiss-cpu rank_bm25
-Запуск:     python src/hybrid.py --strategy structure
-            python src/hybrid.py --model hash --reranker overlap      (швидка перевірка без моделей)
-Демо наживо (для захисту):
-            python src/hybrid.py --ask "що таке зелена хвиля" --type новина --date-from 2026-01-01
-"""
 import argparse
+import csv
 import json
-import re
+import random
 import time
-from collections import defaultdict
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
 try:
-    from chunking import embed, load_docs, load_model, load_queries, norm
-except ImportError:  # файл раніше називався chuncking.py
-    from chuncking import embed, load_docs, load_model, load_queries, norm
-from index import HnswStore, load_chunks
+    from chunking import embed, load_docs, load_model, norm
+except ImportError: 
+    from chuncking import embed, load_docs, load_model, norm
+from hybrid import MODES, Retriever, load_reranker, tokenize
+from index import load_chunks
 
-try:
-    from rank_bm25 import BM25Okapi
-except ImportError:
-    raise SystemExit("Потрібен rank_bm25: pip install rank_bm25")
-
-MODES = ["bm25", "dense", "hybrid", "hybrid_rerank"]
-INF = 999
-
-# Фільтри для перевірки pre-filter (назва, умова). Змінюйте під свій корпус.
-FILTERS = [
-    ("type = новина", {"type": ["новина"]}),
-    ("type = статистика", {"type": ["статистика"]}),
-    ("type = нормативний", {"type": ["нормативний"]}),
-    ("date ≥ 2026-03-01", {"date_from": "2026-03-01"}),
-    ("sensitivity = public, type = новина, date ≥ 2026-01-01",
-     {"sensitivity": ["public"], "type": ["новина"], "date_from": "2026-01-01"}),
-]
+TYPES = ["keyword", "paraphrase", "multistep", "unanswerable"]
+YES = {"1", "так", "yes", "y", "+", "true", "т"}
+NO = {"0", "ні", "no", "n", "-", "false", "н"}
 
 
-# ----------------------------------------------------------------------------
-# Токенізація та фільтри
-# ----------------------------------------------------------------------------
-def tokenize(text, stem=6):
-    """Слова нижнім регістром; грубий «стемінг» для української — перші `stem` літер
-    (усуває більшість закінчень: світлофор/світлофора/світлофорів)."""
-    toks = [t for t in re.findall(r"\w+", text.casefold()) if len(t) > 1]
-    return [t[:stem] for t in toks] if stem else toks
+def load_gold(path: Path, corpus_norm: str):
+    items, bad = [], []
+    for ln, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        g = json.loads(line)
+        ev = g.get("evidence", [])
+        g["answerable"] = bool(ev) and g.get("type") != "unanswerable"
+        miss = [e for e in ev if norm(e) not in corpus_norm]
+        if miss:
+            bad.append((ln, g["q"], miss))
+        else:
+            items.append(g)
+    return items, bad
 
 
-def passes(meta, flt):
-    """meta — словник із type/sensitivity/date; flt — умова фільтра (або None)."""
-    if not flt:
-        return True
-    if flt.get("type") and meta["type"] not in flt["type"]:
-        return False
-    if flt.get("sensitivity") and meta["sensitivity"] not in flt["sensitivity"]:
-        return False
-    if flt.get("date_from") and meta["date"] < flt["date_from"]:
-        return False
-    if flt.get("date_to") and meta["date"] > flt["date_to"]:
-        return False
-    return True
+def build_retriever(args):
+    chunks = load_chunks(Path(args.root), args.strategy)
+    model = load_model(args.model)
+    e5 = "e5" in args.model.lower()
+    R = Retriever(chunks, model, e5, load_reranker(args.reranker), args)
+    R.norm_ctx = [norm(c["context"]) for c in chunks]
+    return R
 
 
-def rrf(rank_lists, k=60):
-    """Reciprocal Rank Fusion: score(d) = Σ 1 / (k + rank_i(d))."""
-    sc = defaultdict(float)
-    for lst in rank_lists:
-        for r, i in enumerate(lst, 1):
-            sc[i] += 1.0 / (k + r)
-    return sorted(sc, key=lambda i: (-sc[i], i))
+def top_indices(R, ids, k):
+    out, seen = [], set()
+    for i in ids:
+        c = R.chunks[i]
+        key = c.get("parent_id") or c["chunk_id"]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(i)
+        if len(out) == k:
+            break
+    return out
 
 
-# ----------------------------------------------------------------------------
-# Rerankers
-# ----------------------------------------------------------------------------
-class CrossEncoderReranker:
-    def __init__(self, name):
-        from sentence_transformers import CrossEncoder
-        self.model = CrossEncoder(name)
-
-    def score(self, query, texts):
-        return self.model.predict([(query, t) for t in texts], show_progress_bar=False)
+def relevant_total(R, evidence):
+    keys = set()
+    for i, c in enumerate(R.chunks):
+        if any(norm(e) in R.norm_ctx[i] for e in evidence):
+            keys.add(c.get("parent_id") or c["chunk_id"])
+    return len(keys)
 
 
-class OverlapReranker:
-    """Заглушка без моделі: частка лексем запиту в тексті (лише для перевірки пайплайну)."""
+def score_query(R, idx, evidence, r_total):
+    flags = [[norm(e) in R.norm_ctx[i] for e in evidence] for i in idx]
+    rel = [any(f) for f in flags]
 
-    def score(self, query, texts):
-        qt = set(tokenize(query))
-        return [len(qt & set(tokenize(t))) / (len(qt) or 1) for t in texts]
+    def cov(k):
+        return sum(any(f[j] for f in flags[:k]) for j in range(len(evidence))) / len(evidence)
 
-
-def load_reranker(name):
-    if name == "none":
-        return None
-    if name == "overlap":
-        return OverlapReranker()
-    return CrossEncoderReranker(name)
+    rank = next((n + 1 for n, r in enumerate(rel) if r), None)
+    dcg = sum(1 / np.log2(n + 2) for n, r in enumerate(rel[:10]) if r)
+    ideal = sum(1 / np.log2(n + 2) for n in range(min(r_total, 10)))
+    return {"r5": cov(5), "r10": cov(10), "rr": 1 / rank if rank else 0.0,
+            "ndcg": dcg / ideal if ideal else 0.0, "rank": rank}
 
 
-# ----------------------------------------------------------------------------
-# Пошуковець
-# ----------------------------------------------------------------------------
-class Retriever:
-    def __init__(self, chunks, model, e5, reranker, args):
-        self.chunks, self.model, self.e5, self.reranker = chunks, model, e5, reranker
-        self.pool, self.rrf_k, self.rerank_in = args.pool, args.rrf_k, args.rerank_in
-        self.stem = args.stem
-        vecs = embed(model, [c["text"] for c in chunks], "passage: " if e5 else "")
-        self.store = HnswStore(vecs.shape[1], args.m, args.ef_construction, args.ef_search)
-        self.store.add(chunks, vecs)  # внутрішній id збігається з індексом у chunks
-        self.bm25 = BM25Okapi([tokenize(c["text"], self.stem) for c in chunks])
-        self.types = np.array([c["type"] for c in chunks])
-        self.sens = np.array([c["sensitivity"] for c in chunks])
-        self.dates = np.array([c["date"] for c in chunks])
-
-    def mask(self, flt):
-        """Булева маска чанків, що проходять pre-filter (None — без фільтра)."""
-        if not flt:
-            return None
-        m = np.ones(len(self.chunks), dtype=bool)
-        if flt.get("type"):
-            m &= np.isin(self.types, flt["type"])
-        if flt.get("sensitivity"):
-            m &= np.isin(self.sens, flt["sensitivity"])
-        if flt.get("date_from"):
-            m &= self.dates >= flt["date_from"]
-        if flt.get("date_to"):
-            m &= self.dates <= flt["date_to"]
-        return m
-
-    def bm25_rank(self, q, mask, n):
-        scores = self.bm25.get_scores(tokenize(q, self.stem))
-        if mask is not None:
-            scores = np.where(mask, scores, -np.inf)
-        order = np.argsort(-scores, kind="stable")[:n]
-        return [int(i) for i in order if scores[i] > 0]  # лише з ненульовим збігом
-
-    def dense_rank(self, qv, mask, n):
-        if mask is None:
-            return self.store.search(qv, n)  # наближений HNSW
-        sims = np.where(mask, self.store.vecs @ qv, -np.inf)  # pre-filter: точний пошук по підмножині
-        order = np.argsort(-sims, kind="stable")[:n]
-        return [int(i) for i in order if np.isfinite(sims[i])]
-
-    def search(self, q, mode, flt, n):
-        """Повертає впорядкований список внутрішніх id (до n штук)."""
-        mask = self.mask(flt)
-        if mode == "bm25":
-            return self.bm25_rank(q, mask, n)
-        qv = embed(self.model, [q], "query: " if self.e5 else "")[0]
-        if mode == "dense":
-            return self.dense_rank(qv, mask, n)
-        fused = rrf([self.bm25_rank(q, mask, self.pool), self.dense_rank(qv, mask, self.pool)], self.rrf_k)
-        if mode == "hybrid":
-            return fused[:n]
-        cand = fused[:self.rerank_in]  # топ-30 → reranker → топ-n
-        if not cand:
-            return []
-        sc = np.asarray(self.reranker.score(q, [self.chunks[i]["text"] for i in cand]))
-        return [cand[i] for i in np.argsort(-sc, kind="stable")][:n]
+def parse_label(s):
+    s = (s or "").strip().lower()
+    return 1 if s in YES else 0 if s in NO else None
 
 
-# ----------------------------------------------------------------------------
-# Оцінювання
-# ----------------------------------------------------------------------------
-def run_mode(R, mode, queries, k, flt=None):
-    rows = []
-    for q in queries:
-        t0 = time.perf_counter()
-        ids = R.search(q["q"], mode, flt, k * 6)  # запас на дедуплікацію ієрархічних дітей
-        ms = (time.perf_counter() - t0) * 1000
-        ctxs, seen = [], set()
-        for i in ids:
-            c = R.chunks[i]
-            key = c.get("parent_id") or c["chunk_id"]
-            if key in seen:
-                continue
-            seen.add(key)
-            ctxs.append(c)
-            if len(ctxs) == k:
-                break
-        rank = next((r for r, c in enumerate(ctxs, 1)
-                     if any(norm(e) in norm(c["context"]) for e in q["evidence"])), None)
-        rows.append({"rank": rank, "ms": ms, "top": ctxs,
-                     "keys": [c.get("parent_id") or c["chunk_id"] for c in ctxs]})
-    return rows
+def cohen_kappa(a, b):
+    n = len(a)
+    n11 = sum(x == 1 and y == 1 for x, y in zip(a, b))
+    n00 = sum(x == 0 and y == 0 for x, y in zip(a, b))
+    n10 = sum(x == 1 and y == 0 for x, y in zip(a, b))
+    n01 = sum(x == 0 and y == 1 for x, y in zip(a, b))
+    po = (n11 + n00) / n
+    pe = ((n11 + n10) * (n11 + n01) + (n00 + n01) * (n00 + n10)) / n ** 2
+    kappa = 1.0 if pe == 1 else (po - pe) / (1 - pe)
+    return {"kappa": kappa, "po": po, "pe": pe, "matrix": [[n00, n01], [n10, n11]], "n": n}
 
 
-def summarize(rows):
-    ms = np.array([r["ms"] for r in rows])
-    return {"recall": float(np.mean([r["rank"] is not None for r in rows])),
-            "mrr": float(np.mean([1 / r["rank"] if r["rank"] else 0 for r in rows])),
-            "ms": float(ms.mean()), "p95": float(np.percentile(ms, 95))}
+def interpret(k):
+    for lim, text in [(0.0, "гірше за випадковість"), (0.2, "слабка згода"), (0.4, "помірна"),
+                      (0.6, "суттєва"), (0.8, "висока"), (1.01, "майже повна")]:
+        if k < lim or lim == 1.01:
+            return text
+    return ""
 
 
-def pick_examples(res, queries):
-    """3 запити, де гібрид кращий за гірший з двох методів (і не гірший за кращий), і 1, де програє."""
-    r = lambda x: x if x is not None else INF
-    wins, losses = [], []
-    for qi in range(len(queries)):
-        b, d, h = (r(res[m][qi]["rank"]) for m in ("bm25", "dense", "hybrid"))
-        if h < INF and h <= min(b, d) and h < max(b, d):
-            wins.append((max(b, d) - h, h < min(b, d), qi))
-        if h > min(b, d):
-            losses.append((h - min(b, d), qi))
-    wins.sort(key=lambda x: (-x[1], -x[0], x[2]))
-    losses.sort(key=lambda x: (-x[0], x[1]))
-    return [w[2] for w in wins[:3]], [l[1] for l in losses[:1]]
+def read_labels(path, col):
+    out = {}
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            out[(r["qid"], r["chunk_key"])] = parse_label(r.get(col))
+    return out
 
 
-def hint(res, qi, win):
-    b, d, h = (res[m][qi]["rank"] for m in ("bm25", "dense", "hybrid"))
-    if win:
-        if b is None or d is None:
-            who = "BM25" if b is None else "dense"
-            return (f"{who} не знайшов відповіді в топ-5, інший метод знайшов; RRF підняв чанк "
-                    "зі списку того методу, що спрацював.")
-        return ("Обидва методи мають відповідь, але не на першому місці; чанк у списках обох, "
-                "тому сума 1/(60+rank) обійшла чанки, що сильні лише в одному списку.")
-    return ("Один метод ставив відповідь вище, але в злитті її обігнали чанки, що мають середні "
-            "позиції в обох списках; RRF не враховує «впевненість» окремого методу.")
+def cmd_kappa(args):
+    A, B = read_labels(args.a, "label_A"), read_labels(args.b, "label_B")
+    keys = [k for k in A if k in B and A[k] is not None and B[k] is not None]
+    skipped = len(A) - len(keys)
+    if len(keys) < 10:
+        raise SystemExit(f"Замало розмічених пар ({len(keys)})")
+    res = cohen_kappa([A[k] for k in keys], [B[k] for k in keys])
+    res["n_queries"] = len({k[0] for k in keys})
+    res["skipped_pairs"] = skipped
+    res["interpretation"] = interpret(res["kappa"])
+    keyf = Path(args.key)
+    if keyf.exists():
+        auto = {}
+        with open(keyf, encoding="utf-8-sig", newline="") as f:
+            for r in csv.DictReader(f):
+                auto[(r["qid"], r["chunk_key"])] = int(r["auto"])
+        for name, L in (("A", A), ("B", B)):
+            ks = [k for k in keys if k in auto]
+            res[f"kappa_{name}_vs_evidence"] = cohen_kappa([L[k] for k in ks], [auto[k] for k in ks])["kappa"]
+    Path(args.out).write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"κ = {res['kappa']:.3f} ({res['interpretation']}); згода {res['po']:.2%}; "
+          f"пар {res['n']}, запитів {res['n_queries']}, пропущено {skipped} → {args.out}")
 
 
-# ----------------------------------------------------------------------------
-# Звіт
-# ----------------------------------------------------------------------------
-def snippet(c, n=170):
-    s = re.sub(r"\s+", " ", c["context"]).strip()
-    return s[:n] + ("…" if len(s) > n else "")
+def cmd_export_kappa(args):
+    root = Path(args.root)
+    R = build_retriever(args)
+    docs = load_docs(root)
+    gold, _ = load_gold(root / args.gold, norm(" ".join(t for _, _, t in docs)))
+    answerable = [g for g in gold if g["answerable"]]
+    if len(answerable) < args.n:
+        raise SystemExit(f"Запитів з відповіддю лише {len(answerable)}")
+    sample = random.Random(args.seed).sample(answerable, args.n)
+    modes = [m for m in MODES if m != "hybrid_rerank" or R.reranker is not None]
+    header = ["qid", "q", "chunk_key", "doc_id", "section", "context", "label_A", "label_B"]
+    rows, key_rows = [], []
+    for g in sample:
+        pool = {}
+        for m in modes:
+            for i in top_indices(R, R.search(g["q"], m, None, 30), 5):
+                c = R.chunks[i]
+                pool.setdefault(c.get("parent_id") or c["chunk_id"], i)
+        keys = sorted(pool)
+        random.Random(args.seed).shuffle(keys) 
+        for key in keys:
+            c = R.chunks[pool[key]]
+            rows.append([g["id"], g["q"], key, c["doc_id"], c["section"],
+                         " ".join(c["context"].split())[:1800], "", ""])
+            key_rows.append([g["id"], key, int(any(norm(e) in R.norm_ctx[pool[key]] for e in g["evidence"]))])
+    for name, col in (("A", 6), ("B", 7)):
+        p = root / f"eval/kappa_pool_{name}.csv"
+        with open(p, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in rows:
+                w.writerow(r)
+        print(f"→ {p}")
+    with open(root / args.key, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["qid", "chunk_key", "auto"])
+        w.writerows(key_rows)
+    print(f"→ {root / args.key}")
+    print(f"Запитів: {len(sample)}, пар «запит—фрагмент»: {len(rows)}.")
 
 
-def write_report(root, args, n_chunks, queries, stats, res, rerank_changes, filt_rows,
-                 wins, losses, bad, versions):
-    L = [
-        "# Гібридний пошук і reranking", "",
-        f"Стратегія chunking: `{args.strategy}`; чанків: {n_chunks}; запитів: {len(queries)}. "
-        f"Модель embeddings: `{args.model}`; reranker: `{args.reranker}`. Версії: {versions}.", "",
-        "Таблиця 1 — Параметри", "", "| Параметр | Значення |", "|---|---|",
-        f"| BM25 | rank_bm25 (BM25Okapi), лексеми = перші {args.stem} літер слова |",
-        f"| Dense | FAISS HNSW, M={args.m}, efConstruction={args.ef_construction}, efSearch={args.ef_search} |",
-        f"| Злиття | RRF, k = {args.rrf_k}; у кожному списку по {args.pool} кандидатів |",
-        f"| Reranking | топ-{args.rerank_in} після RRF → топ-{args.k} |",
-        f"| Pre-filter | type, sensitivity, date (відсікає кандидатів до ранжування) |", "",
-        "Таблиця 2 — Порівняння конфігурацій", "",
-        f"| Конфігурація | recall@{args.k} | MRR@{args.k} | Затримка, мс (сер. / p95) |", "|---|---|---|---|"]
-    for m in MODES:
-        if m in stats:
-            s = stats[m]
-            L.append(f"| {m} | {s['recall']:.2f} | {s['mrr']:.2f} | {s['ms']:.1f} / {s['p95']:.1f} |")
-    if rerank_changes is not None:
-        L += ["", f"Reranker змінив топ-{args.k} відносно hybrid у **{rerank_changes['set']}** із "
-                  f"{len(queries)} запитів (склад) і у **{rerank_changes['order']}** (порядок)."]
-    present = [m for m in MODES if m in res]
-    L += ["", f"Таблиця 3 — Позиція першого влучання в топ-{args.k} («—» якщо немає)", "",
-          "| № | Запит | " + " | ".join(present) + " |", "|---|---|" + "---|" * len(present)]
-    for qi, q in enumerate(queries):
-        L.append(f"| {qi + 1} | {q['q']} | " + " | ".join(str(res[m][qi]["rank"] or "—") for m in present) + " |")
+def best_threshold(pos, neg):
+    best = (0.0, None)
+    for t in sorted(set(pos + neg)):
+        acc = (sum(p >= t for p in pos) + sum(n < t for n in neg)) / (len(pos) + len(neg))
+        if acc > best[0]:
+            best = (acc, t)
+    return best
+
+
+def cmd_run(args):
+    root = Path(args.root)
+    docs = load_docs(root)
+    corpus_norm = norm(" ".join(t for _, _, t in docs))
+    gold, bad = load_gold(root / args.gold, corpus_norm)
+    for ln, q, m in bad:
+        print(f"[warn] запит у рядку {ln} виключено: evidence не знайдено в корпусі: {m}")
+    n_ans = sum(g["answerable"] for g in gold)
+    n_un = len(gold) - n_ans
+    print(f"Запитів: {len(gold)} (з відповіддю {n_ans}, без відповіді {n_un})")
+    if len(gold) < 40 or n_un < 5:
+        print("[warn] потрібно ≥ 40 запитів, з них ≥ 5 без відповіді")
+
+    R = build_retriever(args)
+    modes = [m for m in MODES if m != "hybrid_rerank" or R.reranker is not None]
+    for m in modes:
+        R.search(gold[0]["q"], m, None, 10) 
+
+    lost = [(g["id"], e) for g in gold for e in g["evidence"]
+            if not any(norm(e) in nc for nc in R.norm_ctx)]
+    for gid, e in lost:
+        print(f"[warn] {gid}: evidence розрізано межею чанка або відсутня в чанках: {e!r}")
+    r_totals = {g["id"]: relevant_total(R, g["evidence"]) for g in gold if g["answerable"]}
+
+    res = {m: {} for m in modes}
+    for m in modes:
+        for g in gold:
+            t0 = time.perf_counter()
+            ids = R.search(g["q"], m, None, 60)
+            ms = (time.perf_counter() - t0) * 1000
+            idx = top_indices(R, ids, 10)
+            r = {"ms": ms}
+            if g["answerable"]:
+                r.update(score_query(R, idx, g["evidence"], r_totals[g["id"]]))
+            res[m][g["id"]] = r
+
+    ans = [g for g in gold if g["answerable"]]
+
+    def agg(mode, subset, key):
+        return float(np.mean([res[mode][g["id"]][key] for g in subset]))
+
+    def top_scores(g):
+        qv = embed(R.model, [g["q"]], "query: " if R.e5 else "")[0]
+        return float((R.store.vecs @ qv).max()), float(R.bm25.get_scores(tokenize(g["q"], R.stem)).max())
+    sc = {g["id"]: top_scores(g) for g in gold}
+    un = [g for g in gold if not g["answerable"]]
+    thr = {}
+    for j, name in enumerate(("dense (макс. косинус)", "BM25 (макс. оцінка)")):
+        pos, neg = [sc[g["id"]][j] for g in ans], [sc[g["id"]][j] for g in un]
+        if pos and neg:
+            acc, t = best_threshold(pos, neg)
+            thr[name] = (np.mean(pos), np.mean(neg), t, acc)
+
+    kappa = None
+    kp = root / args.kappa_file
+    if kp.exists():
+        kappa = json.loads(kp.read_text(encoding="utf-8"))
+    L = ["# Оцінювання пошуку", "",
+         f"Золотий набір: `{args.gold}`; стратегія chunking: `{args.strategy}`; чанків: {len(R.chunks)}; "
+         f"embeddings: `{args.model}`; reranker: `{args.reranker}`.", "",
+         "## 1. Золотий набір", "",
+         f"Запитів: **{len(gold)}**, з відповіддю: {n_ans}, без відповіді: **{n_un}**. "
+         "Релевантний фрагмент — той, чий контекст містить еталонну фразу (evidence); для багатокрокових запитів "
+         "recall@k рахується як частка evidence-фраз, знайдених у топ-k.", "",
+         "| Тип | Запитів |", "|---|---|"]
+    cnt = Counter(g["type"] for g in gold)
+    L += [f"| {t} | {cnt.get(t, 0)} |" for t in TYPES]
     if bad:
-        L += ["", "Запити, виключені з оцінки (evidence не знайдено в корпусі):", ""]
-        L += [f"- рядок {ln}: «{q}» — {m}" for ln, q, m in bad]
+        L += ["", "Виключено (evidence не знайдено в корпусі): " + "; ".join(f"рядок {ln}" for ln, _, _ in bad)]
+    if lost:
+        L += ["", "Evidence, яка не потрапила цілою в жоден чанк (занижує всі метрики): "
+              + "; ".join(f"{gid}" for gid, _ in lost)]
 
-    L += ["", "## Pre-filter за метаданими", "",
-          "Фільтр застосовується до ранжування: BM25 обнуляє, а dense виключає чанки, що не проходять умову. "
-          "«Вибірка» — запити, для яких еталонна фраза є хоча б в одному документі, що проходить фільтр. "
-          "«Витоки» — скільки чанків у видачі порушують умову (має бути 0); "
-          "«Влучання поза вибіркою» — скільки запитів знайшли відповідь у документі, що фільтр відсікає (має бути 0).", "",
-          "| Фільтр | Чанків проходить | Запитів у вибірці | recall@5 на вибірці | Витоки | Влучання поза вибіркою |",
-          "|---|---|---|---|---|---|"]
-    for r in filt_rows:
-        rec = "—" if r["n_elig"] == 0 else f"{r['recall']:.2f}"
-        L.append(f"| {r['name']} | {r['n_pass']} | {r['n_elig']} | {rec} | {r['leaks']} | {r['outside_hits']} |")
+    L += ["", f"## 2. Метрики (запити з відповіддю, n = {n_ans})", "",
+          "| Конфігурація | recall@5 | recall@10 | MRR | nDCG@10 | Затримка, мс (сер. / p95) | "
+          "Embedding-викликів / запит | Пар для reranker / запит |", "|---|---|---|---|---|---|---|---|"]
+    for m in modes:
+        ms = np.array([res[m][g["id"]]["ms"] for g in gold])
+        L.append(f"| {m} | {agg(m, ans, 'r5'):.2f} | {agg(m, ans, 'r10'):.2f} | {agg(m, ans, 'rr'):.2f} | "
+                 f"{agg(m, ans, 'ndcg'):.2f} | {ms.mean():.1f} / {np.percentile(ms, 95):.1f} | "
+                 f"{0 if m == 'bm25' else 1} | {args.rerank_in if m == 'hybrid_rerank' else 0} |")
+    L += ["", "Затримка — повний цикл пошуку на CPU (включно з embedding запиту й reranker). "
+          "Вартість: усі моделі локальні, тож грошова вартість запиту = 0; витрати — це час CPU та пам'ять "
+          "(reranker додає найбільше).", "",
+          f"### recall@5 за типом запиту", "",
+          "| Конфігурація | " + " | ".join(t for t in TYPES if t != "unanswerable") + " |",
+          "|---|" + "---|" * 3]
+    for m in modes:
+        cells = []
+        for t in TYPES[:3]:
+            sub = [g for g in ans if g["type"] == t]
+            cells.append(f"{agg(m, sub, 'r5'):.2f} (n={len(sub)})" if sub else "—")
+        L.append(f"| {m} | " + " | ".join(cells) + " |")
 
-    L += ["", "## Приклади: де гібрид виграє і де програє", ""]
-    def block(qi, title, win):
-        q = queries[qi]
-        out = [f"### {title}", "", f"**Запит {qi + 1}:** {q['q']}", "",
-               f"Еталонна фраза: «{q['evidence'][0]}»", "",
-               f"Позиції: BM25 — {res['bm25'][qi]['rank'] or '—'}, dense — {res['dense'][qi]['rank'] or '—'}, "
-               f"hybrid — {res['hybrid'][qi]['rank'] or '—'}"
-               + (f", hybrid+rerank — {res['hybrid_rerank'][qi]['rank'] or '—'}" if "hybrid_rerank" in res else ""), "",
-               "Топ-1 кожного методу:", ""]
-        for m in present:
-            top = res[m][qi]["top"]
-            out.append(f"- **{m}:** " + (snippet(top[0]) if top else "(порожньо)"))
-        out += ["", f"Чому (автопідказка): {hint(res, qi, win)}", "",
-                "> TODO: поясніть власними словами на цьому прикладі.", ""]
-        return out
-    for n, qi in enumerate(wins, 1):
-        L += block(qi, f"Виграш {n}", True)
-    if len(wins) < 3:
-        L += [f"> Знайдено лише {len(wins)} з 3 прикладів виграшу: додайте запити, де слова запиту не збігаються з "
-              "текстом (перефразування) або навпаки містять точні назви/числа.", ""]
-    for qi in losses:
-        L += block(qi, "Програш", False)
-    if not losses:
-        L += ["> Автоматично програшу не знайдено (hybrid не гірший за кращий із BM25/dense на всіх запитах). "
-              "Додайте складніші запити та повторіть запуск.", ""]
-    L += ["## Висновок", "",
-          "> TODO: власними словами — коли гібрид і reranker варті додаткової затримки, спираючись на таблиці 2–3.", ""]
-    path = root / "docs/hybrid_report.md"
+    L += ["", f"## 3. Запити без відповіді (n = {n_un})", "",
+          "Метрики recall/MRR/nDCG для них не визначені. Правильна поведінка системи — не вигадувати відповідь, "
+          "тому перевіряємо, чи можна відрізнити такі запити за найкращою оцінкою відповідності.", "",
+          "| Сигнал | Сер. для запитів із відповіддю | Сер. для запитів без відповіді | Найкращий поріг | "
+          "Точність розрізнення |", "|---|---|---|---|---|"]
+    for name, (p, n, t, acc) in thr.items():
+        L.append(f"| {name} | {p:.3f} | {n:.3f} | {t:.3f} | {acc:.2f} |")
+    L += ["", "> Висновок з 7 запитів — орієнтир, а не доказ: поріг підбирався на тих самих даних."]
+
+    L += ["", "## 4. Узгодженість розмітки (κ Коена)", ""]
+    if kappa:
+        L += [f"Двоє розмітників оцінили {kappa['n']} пар «запит—фрагмент» для {kappa['n_queries']} запитів "
+              "(незалежно, мітка «1» — фрагмент містить відповідь).", "",
+              "| Показник | Значення |", "|---|---|",
+              f"| κ Коена | **{kappa['kappa']:.3f}** ({kappa['interpretation']}) |",
+              f"| Спостережувана згода | {kappa['po']:.2%} |", f"| Очікувана випадкова згода | {kappa['pe']:.2%} |"]
+        for nm in ("A", "B"):
+            if f"kappa_{nm}_vs_evidence" in kappa:
+                L.append(f"| κ розмітника {nm} з авторозміткою за evidence | {kappa[f'kappa_{nm}_vs_evidence']:.3f} |")
+        mtx = kappa["matrix"]
+        L += ["", "Матриця (рядки — розмітник A, стовпці — B):", "",
+              "| | B=0 | B=1 |", "|---|---|---|", f"| A=0 | {mtx[0][0]} | {mtx[0][1]} |",
+              f"| A=1 | {mtx[1][0]} | {mtx[1][1]} |", "",
+              "> TODO: опишіть, у яких випадках розмітники розійшлися і як це вплинуло на золотий набір."]
+    else:
+        L += ["> TODO: κ ще не обчислено. `python src/eval_search.py export-kappa`, двоє розмітників "
+              "заповнюють свої CSV самостійно, потім `python src/eval_search.py kappa --a ... --b ...` "
+              "і повторний запуск `run`."]
+
+    best = max(modes, key=lambda m: (agg(m, ans, "ndcg"), agg(m, ans, "r5")))
+    fast = min(modes, key=lambda m: np.mean([res[m][g["id"]]["ms"] for g in gold]))
+    L += ["", "## 5. Висновок для ЛР 11", "",
+          f"> Підказка за даними: найвищий nDCG@10 — **{best}**, найшвидша — **{fast}**.",
+          "> TODO: власними словами оберіть конфігурацію для ЛР 11 і обґрунтуйте: різниця в якості між "
+          "конфігураціями проти різниці в затримці та складності (reranker), поведінка на типах запитів "
+          "і на запитах без відповіді, обмеження (малий корпус, один тип еталону, evidence-розмітка).", ""]
+    path = root / "docs/search_eval.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(L), encoding="utf-8")
-    return path
-
-
-# ----------------------------------------------------------------------------
-def ask(R, text, args, flt):
-    """Демо одного запиту: топ-k для кожної конфігурації."""
-    for m in MODES:
-        if m == "hybrid_rerank" and R.reranker is None:
-            continue
-        ids = R.search(text, m, flt, args.k)
-        print(f"\n== {m} ==")
-        for r, i in enumerate(ids, 1):
-            c = R.chunks[i]
-            print(f"{r}. [{c['type']}, {c['date']}, {c['sensitivity']}] {c['doc_id']} — {snippet(c, 120)}")
-        if not ids:
-            print("(нічого не знайдено)")
+    for m in modes:
+        print(f"{m:14s} recall@5={agg(m, ans, 'r5'):.2f} recall@10={agg(m, ans, 'r10'):.2f} "
+              f"MRR={agg(m, ans, 'rr'):.2f} nDCG@10={agg(m, ans, 'ndcg'):.2f}")
+    print(f"\nЗвіт: {path}")
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "export-kappa", "kappa"])
     ap.add_argument("--root", default=".")
+    ap.add_argument("--gold", default="eval/gold.jsonl")
     ap.add_argument("--strategy", default="structure", choices=["fixed", "structure", "hierarchical"])
-    ap.add_argument("--model", default="intfloat/multilingual-e5-small", help="модель embeddings або 'hash'")
-    ap.add_argument("--reranker", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-                    help="cross-encoder, 'overlap' (заглушка) або 'none'")
-    ap.add_argument("--queries", default="eval/index_queries.jsonl")
-    ap.add_argument("--k", type=int, default=5)
-    ap.add_argument("--pool", type=int, default=50, help="кандидатів від кожного методу перед RRF")
+    ap.add_argument("--model", default="intfloat/multilingual-e5-small")
+    ap.add_argument("--reranker", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+    ap.add_argument("--pool", type=int, default=50)
     ap.add_argument("--rrf-k", type=int, default=60)
     ap.add_argument("--rerank-in", type=int, default=30)
-    ap.add_argument("--stem", type=int, default=6, help="довжина «стему» для BM25 (0 — вимкнути)")
+    ap.add_argument("--stem", type=int, default=6)
     ap.add_argument("--m", type=int, default=32)
     ap.add_argument("--ef-construction", type=int, default=200)
     ap.add_argument("--ef-search", type=int, default=64)
-    ap.add_argument("--ask", help="виконати один запит і вивести топ-k для кожної конфігурації")
-    ap.add_argument("--type", nargs="*", help="pre-filter: тип документа")
-    ap.add_argument("--sensitivity", nargs="*", help="pre-filter: sensitivity")
-    ap.add_argument("--date-from")
-    ap.add_argument("--date-to")
+    ap.add_argument("--n", type=int, default=12, help="export-kappa: скільки запитів розмічати (≥ 10)")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--key", default="eval/kappa_key.csv")
+    ap.add_argument("--a", default="eval/kappa_pool_A.csv")
+    ap.add_argument("--b", default="eval/kappa_pool_B.csv")
+    ap.add_argument("--out", default="eval/kappa_result.json")
+    ap.add_argument("--kappa-file", default="eval/kappa_result.json")
     args = ap.parse_args()
-    root = Path(args.root)
-
-    chunks = load_chunks(root, args.strategy)
-    e5 = "e5" in args.model.lower()
-    reranker = load_reranker(args.reranker)
-    R = Retriever(chunks, load_model(args.model), e5, reranker, args)
-    print(f"Чанків ({args.strategy}): {len(chunks)}")
-
-    if args.ask:
-        flt = {k: v for k, v in {"type": args.type, "sensitivity": args.sensitivity,
-                                 "date_from": args.date_from, "date_to": args.date_to}.items() if v}
-        ask(R, args.ask, args, flt or None)
-        return
-
-    docs = load_docs(root)
-    corpus_norm = norm(" ".join(t for _, _, t in docs))
-    qpath = root / args.queries
-    if not qpath.exists():
-        raise SystemExit(f"Немає {qpath}")
-    queries, bad = load_queries(qpath, corpus_norm)
-    for ln, q, m in bad:
-        print(f"[warn] запит у рядку {ln} виключено: evidence не знайдено в корпусі: {m}")
-    if not queries:
-        raise SystemExit("Немає придатних запитів")
-
-    modes = [m for m in MODES if m != "hybrid_rerank" or reranker is not None]
-    for m in modes:  # прогрів (завантаження ваг, кеші)
-        R.search(queries[0]["q"], m, None, args.k)
-    res, stats = {}, {}
-    for m in modes:
-        res[m] = run_mode(R, m, queries, args.k)
-        stats[m] = summarize(res[m])
-        s = stats[m]
-        print(f"{m:14s} recall@{args.k}={s['recall']:.2f} MRR={s['mrr']:.2f} {s['ms']:.1f} мс")
-
-    rerank_changes = None
-    if "hybrid_rerank" in res:
-        rerank_changes = {
-            "set": sum(set(res["hybrid"][i]["keys"]) != set(res["hybrid_rerank"][i]["keys"]) for i in range(len(queries))),
-            "order": sum(res["hybrid"][i]["keys"] != res["hybrid_rerank"][i]["keys"] for i in range(len(queries))),
-        }
-        print(f"reranker змінив топ-{args.k}: склад у {rerank_changes['set']}, порядок у {rerank_changes['order']} запитах")
-
-    # --- перевірка pre-filter ---
-    doc_meta = {}
-    for c in chunks:
-        doc_meta.setdefault(c["doc_id"], {k: c[k] for k in ("type", "sensitivity", "date")})
-    evidence_docs = [{d for d, _, t in docs if any(norm(e) in norm(t) for e in q["evidence"])} for q in queries]
-    filt_rows = []
-    for name, flt in FILTERS:
-        n_pass = sum(passes(c, flt) for c in chunks)
-        elig = [qi for qi in range(len(queries))
-                if any(passes(doc_meta[d], flt) for d in evidence_docs[qi] if d in doc_meta)]
-        mode = "hybrid_rerank" if "hybrid_rerank" in res else "hybrid"
-        rows = run_mode(R, mode, queries, args.k, flt) if n_pass else [{"rank": None, "top": []}] * len(queries)
-        leaks = sum(not passes(c, flt) for r in rows for c in r["top"])
-        outside = sum(rows[qi]["rank"] is not None for qi in range(len(queries)) if qi not in set(elig))
-        recall = float(np.mean([rows[qi]["rank"] is not None for qi in elig])) if elig else 0.0
-        filt_rows.append({"name": name, "n_pass": n_pass, "n_elig": len(elig), "recall": recall,
-                          "leaks": leaks, "outside_hits": outside})
-        print(f"[filter] {name}: чанків {n_pass}, витоків {leaks}, влучань поза вибіркою {outside}")
-
-    wins, losses = pick_examples(res, queries)
-    try:
-        import sentence_transformers
-        import faiss
-        versions = (f"sentence-transformers {sentence_transformers.__version__}, faiss {faiss.__version__}, "
-                    f"numpy {np.__version__}")
-    except ImportError:
-        versions = f"numpy {np.__version__}"
-    path = write_report(root, args, len(chunks), queries, stats, res, rerank_changes, filt_rows,
-                        wins, losses, bad, versions)
-    print(f"\nЗвіт: {path}")
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    {"run": cmd_run, "export-kappa": cmd_export_kappa, "kappa": cmd_kappa}[args.cmd](args)
 
 
 if __name__ == "__main__":

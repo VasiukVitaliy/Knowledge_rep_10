@@ -1,32 +1,3 @@
-#!/usr/bin/env python3
-"""ЛР 10, Результат 5: золотий набір і оцінювання пошуку.
-
-Три команди:
-  run           (за замовчуванням) оцінює 4 конфігурації (bm25, dense, hybrid, hybrid_rerank)
-                на eval/gold.jsonl: recall@5/10, MRR, nDCG@10, затримка, вартість;
-                окремо — запити без відповіді; пише docs/search_eval.md.
-  export-kappa  готує eval/kappa_pool_A.csv і eval/kappa_pool_B.csv для двох розмітників
-                (≥ 10 запитів, пул кандидатів із усіх конфігурацій) та eval/kappa_key.csv (авторозмітка).
-  kappa         читає заповнені файли обох розмітників і рахує κ Коена → eval/kappa_result.json
-                (потім `run` додасть його до звіту).
-
-Формат gold.jsonl (по одному JSON на рядок):
-  {"id": "g01", "type": "keyword|paraphrase|multistep|unanswerable", "q": "...",
-   "evidence": ["дослівна фраза з корпусу", ...]}      # для unanswerable — []
-Релевантний фрагмент = той, чий контекст містить хоча б одну evidence-фразу. Тож розмітка не
-залежить від chunk_id і однакова для всіх стратегій chunking.
-
-Метрики (лише для запитів з відповіддю):
-  recall@k — частка evidence-фраз, що трапилися в топ-k контекстів (для 1 фрази це «влучив/ні»);
-  MRR      — 1 / позиція першого релевантного контексту (у топ-10);
-  nDCG@10  — бінарна релевантність, ідеал = min(кількість релевантних у корпусі, 10).
-
-Запуск:
-  python src/eval_search.py --model hash --reranker overlap       (швидка перевірка)
-  python src/eval_search.py export-kappa --n 12
-  python src/eval_search.py kappa --a eval/kappa_pool_A.csv --b eval/kappa_pool_B.csv
-  python src/eval_search.py run --strategy structure
-"""
 import argparse
 import csv
 import json
@@ -39,7 +10,7 @@ import numpy as np
 
 try:
     from chunking import embed, load_docs, load_model, norm
-except ImportError:  # файл раніше називався chuncking.py
+except ImportError: 
     from chuncking import embed, load_docs, load_model, norm
 from hybrid import MODES, Retriever, load_reranker, tokenize
 from index import load_chunks
@@ -49,9 +20,6 @@ YES = {"1", "так", "yes", "y", "+", "true", "т"}
 NO = {"0", "ні", "no", "n", "-", "false", "н"}
 
 
-# ----------------------------------------------------------------------------
-# Дані
-# ----------------------------------------------------------------------------
 def load_gold(path: Path, corpus_norm: str):
     items, bad = [], []
     for ln, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -78,7 +46,6 @@ def build_retriever(args):
 
 
 def top_indices(R, ids, k):
-    """Індекси чанків у видачі без дублів за батьком (для ієрархічної стратегії)."""
     out, seen = [], set()
     for i in ids:
         c = R.chunks[i]
@@ -93,7 +60,6 @@ def top_indices(R, ids, k):
 
 
 def relevant_total(R, evidence):
-    """Скільки різних (за батьком) контекстів у корпусі містять хоча б одну evidence-фразу."""
     keys = set()
     for i, c in enumerate(R.chunks):
         if any(norm(e) in R.norm_ctx[i] for e in evidence):
@@ -115,9 +81,6 @@ def score_query(R, idx, evidence, r_total):
             "ndcg": dcg / ideal if ideal else 0.0, "rank": rank}
 
 
-# ----------------------------------------------------------------------------
-# κ Коена
-# ----------------------------------------------------------------------------
 def parse_label(s):
     s = (s or "").strip().lower()
     return 1 if s in YES else 0 if s in NO else None
@@ -194,7 +157,7 @@ def cmd_export_kappa(args):
                 c = R.chunks[i]
                 pool.setdefault(c.get("parent_id") or c["chunk_id"], i)
         keys = sorted(pool)
-        random.Random(args.seed).shuffle(keys)  # порядок без підказок про метод
+        random.Random(args.seed).shuffle(keys) 
         for key in keys:
             c = R.chunks[pool[key]]
             rows.append([g["id"], g["q"], key, c["doc_id"], c["section"],
@@ -212,15 +175,10 @@ def cmd_export_kappa(args):
         w = csv.writer(f)
         w.writerow(["qid", "chunk_key", "auto"])
         w.writerows(key_rows)
-    print(f"→ {root / args.key}  (авторозмітка за evidence; розмітникам НЕ показувати)")
-    print(f"Запитів: {len(sample)}, пар «запит—фрагмент»: {len(rows)}.\n"
-          "Кожен розмітник самостійно ставить у своєму файлі в колонці label_A / label_B: "
-          "1 — фрагмент містить відповідь на запит, 0 — ні. Не радьтеся між собою.")
+    print(f"→ {root / args.key}")
+    print(f"Запитів: {len(sample)}, пар «запит—фрагмент»: {len(rows)}.")
 
 
-# ----------------------------------------------------------------------------
-# Оцінювання
-# ----------------------------------------------------------------------------
 def best_threshold(pos, neg):
     best = (0.0, None)
     for t in sorted(set(pos + neg)):
@@ -246,7 +204,7 @@ def cmd_run(args):
     R = build_retriever(args)
     modes = [m for m in MODES if m != "hybrid_rerank" or R.reranker is not None]
     for m in modes:
-        R.search(gold[0]["q"], m, None, 10)  # прогрів
+        R.search(gold[0]["q"], m, None, 10) 
 
     lost = [(g["id"], e) for g in gold for e in g["evidence"]
             if not any(norm(e) in nc for nc in R.norm_ctx)]
@@ -271,7 +229,6 @@ def cmd_run(args):
     def agg(mode, subset, key):
         return float(np.mean([res[mode][g["id"]][key] for g in subset]))
 
-    # --- запити без відповіді: сигнал «впевненості» ---
     def top_scores(g):
         qv = embed(R.model, [g["q"]], "query: " if R.e5 else "")[0]
         return float((R.store.vecs @ qv).max()), float(R.bm25.get_scores(tokenize(g["q"], R.stem)).max())
@@ -284,7 +241,6 @@ def cmd_run(args):
             acc, t = best_threshold(pos, neg)
             thr[name] = (np.mean(pos), np.mean(neg), t, acc)
 
-    # --- звіт ---
     kappa = None
     kp = root / args.kappa_file
     if kp.exists():

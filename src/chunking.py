@@ -1,41 +1,16 @@
-#!/usr/bin/env python3
-"""ЛР 10, Результат 2: стратегії chunking і їх порівняння.
-
-Стратегії:
-  fixed         — фіксований розмір (символи) з overlap;
-  structure     — за структурою: заголовки, пункти (8.7.3), абзаци;
-  hierarchical  — батьківсько-дочірня: індексуємо малі «діти», у контекст
-                  віддаємо цілого «батька» (структурний чанк).
-
-Вхід:  data/corpus.jsonl і data/clean/<doc_id>.txt (з build_corpus.py),
-       eval/chunk_queries.jsonl — 10 тестових запитів (формат нижче).
-Вихід: data/chunks/<стратегія>.jsonl, data/index/<стратегія>.npy,
-       docs/chunking_cmp.md (таблиці recall@5 і розміру контексту).
-
-Формат eval/chunk_queries.jsonl (по одному JSON на рядок):
-  {"q": "Яка максимальна швидкість у житлових зонах?",
-   "evidence": ["не повинна перевищувати 20 км/год"]}
-  evidence — дослівна фраза з корпусу (5–15 слів), яка має бути у знайденому
-  контексті. Так оцінка не залежить від ідентифікаторів чанків і однакова для
-  всіх стратегій.
-
-Залежності: pip install numpy sentence-transformers faiss-cpu
-Запуск:     python src/chunking.py
-            python src/chunking.py --model hash   (швидка перевірка без моделі)
-"""
 import argparse
 import hashlib
 import json
 import re
 import time
-from dataclasses import asdict, dataclass
+from datac import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-ITEM_RE = re.compile(r"^(\d{1,2}(?:\.\d+)+)\.?\s")  # 8.1.  8.7.3
-HEAD_RE = re.compile(r"^(?:#{1,6}\s+.+|\d{1,2}\.\s+[А-ЯІЇЄҐA-Z].{2,100})$")  # ## Назва | 8. Назва
+ITEM_RE = re.compile(r"^(\d{1,2}(?:\.\d+)+)\.?\s") 
+HEAD_RE = re.compile(r"^(?:#{1,6}\s+.+|\d{1,2}\.\s+[А-ЯІЇЄҐA-Z].{2,100})$") 
 SENT_SPLIT = re.compile(r"(?<=[.!?;:])\s+|\n+")
 
 
@@ -45,8 +20,8 @@ class Chunk:
     doc_id: str
     strategy: str
     section: str
-    text: str                    # що індексуємо (embedding)
-    context: str                 # що віддаємо як результат (для hierarchical = батько)
+    text: str              
+    context: str                 
     parent_id: Optional[str]
     title: str
     type: str
@@ -55,11 +30,7 @@ class Chunk:
     source_url: str
 
 
-# ----------------------------------------------------------------------------
-# Допоміжне
-# ----------------------------------------------------------------------------
 def split_long(line, limit):
-    """Ріже надто довгий рядок по реченнях."""
     if len(line) <= limit:
         return [line]
     parts, cur = [], ""
@@ -72,7 +43,7 @@ def split_long(line, limit):
     if cur:
         parts.append(cur)
     out = []
-    for p in parts:  # речення довше за limit — ріжемо жорстко
+    for p in parts:  
         while len(p) > limit:
             out.append(p[:limit])
             p = p[limit:]
@@ -80,11 +51,7 @@ def split_long(line, limit):
     return out
 
 
-# ----------------------------------------------------------------------------
-# Стратегія 1: фіксований розмір з overlap
-# ----------------------------------------------------------------------------
 def chunk_fixed(text, size=800, overlap=150):
-    """Вікно `size` символів, крок `size - overlap`; межі зсуваємо до кінця речення/слова."""
     text = re.sub(r"\s+", " ", text).strip()
     out, start, n = [], 0, len(text)
     while start < n:
@@ -106,18 +73,13 @@ def chunk_fixed(text, size=800, overlap=150):
         nxt = end - overlap
         if nxt <= start:
             nxt = end
-        while nxt < n and nxt > 0 and text[nxt - 1] != " ":  # не починаємо посеред слова
+        while nxt < n and nxt > 0 and text[nxt - 1] != " ":  
             nxt += 1
         start = nxt
     return out
 
 
-# ----------------------------------------------------------------------------
-# Стратегія 2: за структурою (заголовки / пункти / абзаци)
-# ----------------------------------------------------------------------------
 def chunk_structure(text, min_chars=300, max_chars=1200):
-    """Заголовок завжди починає новий чанк; пункти (8.1, 8.7.3) об'єднуються до min_chars,
-    чанк не перевищує max_chars. Повертає [(section, text)]."""
     units = []
     for line in text.splitlines():
         line = line.strip()
@@ -160,18 +122,14 @@ def chunk_structure(text, min_chars=300, max_chars=1200):
         state["size"] += len(piece) + 1
     flush()
 
-    if len(chunks) > 1 and len(chunks[-1][1]) < min_chars:  # короткий хвіст → до попереднього
+    if len(chunks) > 1 and len(chunks[-1][1]) < min_chars:  
         sec, txt = chunks.pop()
         psec, ptxt = chunks.pop()
         chunks.append((psec, ptxt + "\n" + txt))
     return chunks
 
 
-# ----------------------------------------------------------------------------
-# Стратегія 3: ієрархічна (малі діти для пошуку, великий батько як контекст)
-# ----------------------------------------------------------------------------
 def chunk_hierarchical(text, parent_max=1800, child_size=350):
-    """Повертає [(section, child_text, parent_index, parent_text)]."""
     out = []
     for pi, (section, ptext) in enumerate(chunk_structure(text, min_chars=500, max_chars=parent_max)):
         sents = [s.strip() for s in SENT_SPLIT.split(ptext) if s.strip()]
@@ -188,16 +146,13 @@ def chunk_hierarchical(text, parent_max=1800, child_size=350):
     return out
 
 
-# ----------------------------------------------------------------------------
-# Побудова чанків для всіх документів
-# ----------------------------------------------------------------------------
 def load_docs(root: Path):
     meta = {}
     with (root / "data/corpus.jsonl").open(encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
             meta.setdefault(r["doc_id"], {k: r[k] for k in
-                            ("title", "type", "date", "sensitivity", "source_url")})
+                                        ("title", "type", "date", "sensitivity", "source_url")})
     docs = []
     for doc_id, m in meta.items():
         p = root / "data/clean" / f"{doc_id}.txt"
@@ -227,11 +182,7 @@ def build_chunks(strategy, docs, params):
     return chunks
 
 
-# ----------------------------------------------------------------------------
-# Embeddings + індекс
-# ----------------------------------------------------------------------------
 class HashEmbedder:
-    """Заглушка без завантаження моделі (bag-of-words у хеш-простір): лише для перевірки пайплайну."""
     dim = 512
 
     def encode(self, texts, **kw):
@@ -258,7 +209,6 @@ def embed(model, texts, prefix=""):
 
 
 class FlatIndex:
-    """Точний індекс за косинусною подібністю (FAISS IndexFlatIP, а без FAISS — numpy)."""
 
     def __init__(self, vecs):
         self.vecs = vecs
@@ -277,9 +227,6 @@ class FlatIndex:
         return [int(i) for i in np.argsort(-(self.vecs @ q))[:k]]
 
 
-# ----------------------------------------------------------------------------
-# Оцінювання
-# ----------------------------------------------------------------------------
 def norm(s):
     return re.sub(r"\s+", " ", s).casefold()
 
@@ -320,9 +267,6 @@ def evaluate(chunks, index, q_vecs, queries, k=5):
     return rows
 
 
-# ----------------------------------------------------------------------------
-# Звіт
-# ----------------------------------------------------------------------------
 def write_report(root, model_name, params, stats, per_query, queries, bad, versions):
     L = [
         "# Порівняння стратегій chunking", "",

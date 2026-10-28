@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-"""ЛР 10, Результат 3: векторний індекс (FAISS HNSW) і порівняння embeddings.
-
-Що робить:
-  1. читає чанки обраної стратегії (data/chunks/<стратегія>.jsonl з chunking.py);
-  2. для кожної моделі embeddings будує індекс FAISS HNSW (M, efConstruction, efSearch зафіксовано),
-     вимірює час embedding / побудови індексу;
-  3. на запитах eval/index_queries.jsonl (потрібно 20) рахує recall@5, MRR@5 і затримку
-     (embedding запиту та пошук окремо) для кількох значень efSearch;
-  4. перевіряє upsert/delete на 5 документах (м'яке видалення + додавання, компактація);
-  5. пише docs/embeddings_cmp.md і зберігає індекси в data/index/.
-
-Формат запитів — той самий, що й у chunk_queries.jsonl:
-  {"q": "...", "evidence": ["дослівна фраза з корпусу"]}
-
-Залежності: pip install numpy sentence-transformers faiss-cpu
-Запуск:     python src/index.py --strategy structure
-            python src/index.py --models hash          (швидка перевірка без моделей)
-"""
 import argparse
 import json
 import random
@@ -29,7 +10,7 @@ import numpy as np
 
 try:
     from chunking import embed, load_docs, load_model, load_queries, norm
-except ImportError:  # файл раніше називався chuncking.py
+except ImportError: 
     from chuncking import embed, load_docs, load_model, load_queries, norm
 
 try:
@@ -41,19 +22,11 @@ DEFAULT_MODELS = [
     "intfloat/multilingual-e5-small",
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 ]
-REPEAT = 20           # скільки разів повторюємо пошук для усереднення затримки
-DEAD_RATIO_LIMIT = 0.3  # при такій частці видалених векторів індекс перебудовується
+REPEAT = 20      
+DEAD_RATIO_LIMIT = 0.3  
 
 
-# ----------------------------------------------------------------------------
-# Сховище: HNSW + м'яке видалення
-# ----------------------------------------------------------------------------
 class HnswStore:
-    """FAISS IndexHNSWFlat (косинус через нормовані вектори + inner product).
-
-    HNSW у FAISS не підтримує remove_ids, тому видалення — «надгробки» (alive=False);
-    пошук бере з запасом і відфільтровує видалені. Коли видалених забагато — compact().
-    """
 
     def __init__(self, dim, M, ef_construction, ef_search):
         self.dim, self.M, self.ef_construction, self.ef_search = dim, M, ef_construction, ef_search
@@ -97,7 +70,6 @@ class HnswStore:
         return len(ids)
 
     def upsert_doc(self, doc_id, chunks, vecs):
-        """Оновлення документа = видалити старі чанки + додати нові."""
         self.delete_doc(doc_id)
         self.add(chunks, vecs)
 
@@ -110,7 +82,6 @@ class HnswStore:
         self.compactions += 1
 
     def search(self, q, n):
-        """Повертає до n внутрішніх id живих чанків, від найближчого."""
         total = self.index.ntotal
         if total == 0:
             return []
@@ -120,9 +91,6 @@ class HnswStore:
         return [int(i) for i in ids[0] if i >= 0 and self.alive[int(i)]][:n]
 
 
-# ----------------------------------------------------------------------------
-# Побудова й оцінювання
-# ----------------------------------------------------------------------------
 def load_chunks(root: Path, strategy):
     p = root / f"data/chunks/{strategy}.jsonl"
     if not p.exists():
@@ -143,7 +111,7 @@ def build_store(model, e5, chunks, args):
 
 def evaluate(store, model, e5, queries, k):
     prefix = "query: " if e5 else ""
-    store.search(embed(model, [queries[0]["q"]], prefix)[0], k)  # прогрів
+    store.search(embed(model, [queries[0]["q"]], prefix)[0], k)  
     rows = []
     for q in queries:
         t0 = time.perf_counter()
@@ -151,7 +119,7 @@ def evaluate(store, model, e5, queries, k):
         t_emb = (time.perf_counter() - t0) * 1000
         t1 = time.perf_counter()
         for _ in range(REPEAT):
-            ids = store.search(qv, k * 6)  # запас: ієрархічні діти можуть мати одного батька
+            ids = store.search(qv, k * 6)  
         t_srch = (time.perf_counter() - t1) * 1000 / REPEAT
         contexts, seen = [], set()
         for i in ids:
@@ -180,16 +148,12 @@ def summarize(rows):
     }
 
 
-# ----------------------------------------------------------------------------
-# Перевірка upsert / delete на n документах
-# ----------------------------------------------------------------------------
 def top_chunks(store, model, e5, text, n=5):
     qv = embed(model, [text], "query: " if e5 else "")[0]
     return [store.chunks[i] for i in store.search(qv, n)]
 
 
 def crud_test(store, model, e5, doc_ids):
-    """Для кожного документа: upsert зміненого тексту → delete → відновлення оригіналу."""
     passage = "passage: " if e5 else ""
     rows = []
     for d in doc_ids:
@@ -233,9 +197,6 @@ def crud_test(store, model, e5, doc_ids):
     return rows
 
 
-# ----------------------------------------------------------------------------
-# Звіт
-# ----------------------------------------------------------------------------
 def ok(b):
     return "✓" if b else "✗"
 
@@ -372,7 +333,7 @@ def main():
             print(f"{name.split('/')[-1]:45s} ef={ef:4d} recall@{args.k}={s['recall']:.2f} "
                   f"MRR={s['mrr']:.2f} emb={s['emb_ms']:.1f}мс пошук={s['srch_ms']:.3f}мс")
         store.ef_search = args.ef_search
-        if mi == 0:  # перевірка upsert/delete на першій моделі
+        if mi == 0:  
             ids = sorted({c["doc_id"] for c in chunks})
             sample = random.sample(ids, min(args.test_docs, len(ids)))
             crud = crud_test(store, model, e5, sample)
